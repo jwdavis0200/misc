@@ -1,0 +1,185 @@
+═══════════════════════════════════════════════════════
+THE FULL FIX — STUCK "SYSTEM VALIDATION" (PENDING), OIM 12c
+═══════════════════════════════════════════════════════
+
+Background in one line: System Validation is an OOTB task with no adapter by design; it fires automatically at every process instantiation (VERIFIED: dev guide ch.2 — tasks fire on instantiation; it is not fired by reconciliation); it completes when the process form is saved with all Required fields populated; it's stuck because that save never happened.
+
+─────────────────────────────────────────
+STEP 0 — DIAGNOSE (5 min, do this first)
+─────────────────────────────────────────
+
+1. Open the user in Identity Self Service / Identity System Administration → Accounts → open the stuck account → view the process form.
+
+2. Check every field marked Required on the form. Are any empty?
+   - Empty required fields → cause confirmed: the form was never saved complete. Go to STEP 1.
+   - All populated → the instance is wedged. Skip to STEP 2.
+
+3. Note how the account was provisioned:
+   - Via access policy / role assignment (automatic) → the classic cause: the process definition's Auto Save Form is off, or a prepopulate adapter didn't fill a required field (VERIFIED mechanics: dev guide ch.2 Table 2-1; community: SO q45484081).
+   - Via request → form data may not have flowed from the request form to the process form.
+
+4. Optional but recommended for the incident record: check the process definition in Design Console (deprecated but present in 12.2.1.4 — VERIFIED, omusg ch.21 note): Process Management → Process Definition → your process → is Auto Save Form checked? Also check the process form's Required fields and which prepopulate adapters are attached.
+
+─────────────────────────────────────────
+STEP 1 — THE FIX (cleanest): RELEASE VIA FORM SAVE
+─────────────────────────────────────────
+
+The 12c-native path, documented in the Self Service guide ch.9:
+
+1. Log in to Identity Self Service as an admin (System Administrator role).
+2. Self Service tab → Provisioning Tasks box → Open Tasks.
+3. Search: Task Name = System Validation (or Advanced search: Task Status = Pending + Application Instance = the app).
+4. Select the task → Actions → Edit Form ("You can edit the process form associated with a provisioning workflow to provide missing information" — VERIFIED 12.2.1.4 omusg ch.9).
+5. Fill every required field → Save.
+6. Also/or edit the form directly from the user's account page if you're already there — either save works.
+
+The save is the event System Validation waits on: it completes, and the process advances (Create User etc. fire). Verify in resource history.
+
+Caveat (UNVERIFIED): if the pending System Validation doesn't appear on the Provisioning Tasks page (it lists tasks assigned to you plus failed automatic tasks; a system-owned pending task may not surface), edit the form from the account page instead — the account's own process form is editable from the Accounts view while it's in Provisioning state.
+
+─────────────────────────────────────────
+STEP 2 — UI MANUAL COMPLETE (before writing any code)
+─────────────────────────────────────────
+
+12.2.1.4 has a Manual Complete action on the same page (VERIFIED, omusg ch.9 "Manually Completing a Task"):
+
+1. Provisioning Tasks page → search Task Name = System Validation, Task Status = Pending.
+2. Select the task → Actions → Manual Complete → confirm.
+
+If the task isn't visible there, go to STEP 3.
+
+─────────────────────────────────────────
+STEP 3 — API MANUAL COMPLETE (the reliable hammer)
+─────────────────────────────────────────
+
+Same operation the UI performs (SCH.SCH_STATUS becomes 'MC' — Manually Completed, permanently visible in history; note it in your incident log). All methods VERIFIED in the 12.2.1.4 javadoc; the filter/result-column names are COMMUNITY-VERIFIED (consistent across oimacademy + massivegaze + oraclestack, and match the javadoc's documented metadata naming convention).
+
+3a. Set up the standalone client (12c-native, VERIFIED dev guide ch.19.8):
+
+    unzip $MW_HOME/idm/designconsole/CustomClient.zip
+
+    It ships with config/authwl.conf and xlCustomClient.bat/xlconfig.xml, which the dev guide tells you to point at your OIM host:
+
+      -Djava.security.auth.login.config=config/authwl.conf
+      -Djava.naming.provider.url=t3://OIM_HOST:14000
+      <appServerName>weblogic</appServerName>
+
+    The designconsole directory's lib set provides the client classpath (oimclient.jar etc.). If you hand-roll the classpath instead, the community jar list for standalone clients is: commons-logging.jar, eclipselink.jar, jrf-api.jar, oimclient.jar, spring.jar, wlfullclient.jar (COMMUNITY-VERIFIED; cross-check against your designconsole/lib contents).
+
+3b. The client code (OIMClient pattern per dev guide 19.2.2 — VERIFIED; task-completion logic per javadoc + community):
+
+    import Thor.API.Operations.tcProvisioningOperationsIntf;
+    import Thor.API.tcResultSet;
+    import java.util.HashMap;
+    import java.util.Hashtable;
+    import java.util.Map;
+    import javax.security.auth.login.LoginException;
+    import oracle.iam.platform.OIMClient;
+
+    public class ReleaseSystemValidation {
+
+        // EDIT THESE
+        static String OIM_USER      = "xelsysadm";
+        static String OIM_PASS      = "<password>";
+        static String OIM_URL       = "t3://<oim-host>:14000"; // OIM managed server t3 port
+        static String AUTHWL_CONF   = "<path>/designconsole/config/authwl.conf";
+        static String RESOURCE_NAME = "<resource object name>"; // e.g. "AD User"
+        static String TARGET_USER   = "<user login>";  // null = every stuck user (CAREFUL)
+        static boolean DRY_RUN      = true;           // flip to false to actually complete
+
+        public static void main(String[] args) throws Exception {
+            System.setProperty("java.security.auth.login.config", AUTHWL_CONF);
+            System.setProperty("OIM.AppServerType", "wls");
+            System.setProperty("APPSERVER_TYPE", "wls");
+
+            Hashtable env = new Hashtable();
+            env.put(OIMClient.JAVA_NAMING_FACTORY_INITIAL,
+                    "weblogic.jndi.WLInitialContextFactory");
+            env.put(OIMClient.JAVA_NAMING_PROVIDER_URL, OIM_URL);
+            OIMClient client = new OIMClient(env);
+            client.login(OIM_USER, OIM_PASS.toCharArray());
+            try {
+                tcProvisioningOperationsIntf prov =
+                    client.getService(tcProvisioningOperationsIntf.class);
+
+                Map filter = new HashMap();
+                filter.put("Objects.Name", RESOURCE_NAME);
+                filter.put("Process Definition.Tasks.Task Name", "System Validation");
+
+                tcResultSet rs = prov.findAllOpenProvisioningTasks(
+                                     filter, new String[]{"Pending"});
+                int n = rs.getRowCount();
+                System.out.println("Pending System Validation tasks found: " + n);
+
+                for (int i = 0; i < n; i++) {
+                    rs.goToRow(i);
+                    String user = rs.getStringValue(
+                        "Process Instance.Task Information.Target User");
+                    long key = rs.getLongValue(
+                        "Process Instance.Task Details.Key");
+                    if (TARGET_USER != null && !TARGET_USER.equals(user)) continue;
+                    System.out.println((DRY_RUN ? "[DRY-RUN] would complete"
+                                                : "completing")
+                        + " task key=" + key + " user=" + user);
+                    if (!DRY_RUN)
+                        prov.setTasksCompletedManually(new long[]{key});
+                }
+            } finally {
+                client.logout();
+            }
+        }
+    }
+
+3c. Run procedure:
+    - First run with DRY_RUN=true — confirm it lists exactly one task for your user.
+    - Flip to false, re-run.
+    - Exceptions to expect (javadoc): tcTaskNotFoundException (bad key), tcBulkException (one of many failed), tcAPIException (general).
+
+3d. Fallback if findAllOpenProvisioningTasks returns nothing (possible, since its javadoc wording says "assigned to any user"): read the task key with a SELECT against the OIM schema (read-only, safe), then feed it to the same API call. Community-verified query (oraclestack, PKG/MIL/OSI/SCH tables):
+
+    SELECT sch.sch_key
+    FROM sch
+    JOIN osi ON sch.sch_key = osi.sch_key
+    JOIN mil ON osi.mil_key = mil.mil_key
+    JOIN pkg ON pkg.pkg_key = osi.pkg_key
+    WHERE pkg.pkg_name = '<process definition name>'
+      AND mil.mil_name = 'System Validation'
+      AND sch.sch_status IN ('P','UC');
+
+    WARNING: without user scoping this returns every stuck user's task. Do NOT blind-complete the whole list — either confirm each key belongs to your user (check osi/orc linkage against your schema first; I have not verified the user-scoping join columns against a primary source), or complete keys one at a time after eyeballing. The API path's TARGET_USER filter is the safer scoper.
+
+─────────────────────────────────────────
+STEP 4 — IF THE PROCESS DOESN'T CONTINUE AFTER MC
+─────────────────────────────────────────
+
+UNVERIFIED (flagged): whether manual-complete cascades the Responses-tab generated tasks (a manual completion may not emit a response code). Check resource history after Step 3:
+
+- If Create User fired → done, go to Step 5.
+- If not:
+    a. Try the STEP 1 form save again — the blocker is gone, the save may now drive the flow.
+    b. Or insert the next task manually: user → Accounts → resource/account history → Add task (available if the task allows manual insert — Design Console task property "Disable Manual Insert" unchecked); or via API addProcessTaskInstance(taskKey, orcKey) (VERIFIED javadoc — "Provides the ability to add/execute a task where the task's manual insert property is enabled"). Both keys are in the result set from Step 3: "Process Definition.Tasks.Key" and "Process Instance.Key" (COMMUNITY-VERIFIED columns).
+
+─────────────────────────────────────────
+STEP 5 — VERIFY (do not skip)
+─────────────────────────────────────────
+
+1. Resource history: System Validation = Completed or Manually Completed; next task (Create User) ran and completed.
+2. Account status = Provisioned (no longer Provisioning).
+3. The target system actually has the account — Create User's adapter did real work; MC on System Validation only releases the flow, it doesn't provision anything itself.
+4. Incident log: cause, fix used, and the fact the task shows 'MC' (auditors will ask).
+
+─────────────────────────────────────────
+STEP 6 — IF YOU JUST WANT IT GONE (abandon path)
+─────────────────────────────────────────
+
+UI revoke is blocked while the account is in Provisioning (ProvisioningService.revoke accepts only Provisioned/Enabled/Disabled — VERIFIED javadoc). The supported cleanup is Oracle's own: bundle patches BP16 onward (2021+) added the "Real-time Provisioning Status Accounts Purge" — a sanctioned continuous purge of accounts stuck in Provisioning (VERIFIED: admin guide ch.22 + BP16/BP19/BP20/BP23/BP24 readmes). Check your BP level; if recent, use the purge per the admin guide; if you're pre-BP16 and Steps 1–4 failed, raise an SR. NEVER UPDATE SCH/OSI/ORC rows directly — unsupported, destroys the audit trail.
+
+─────────────────────────────────────────
+STEP 7 — PREVENT THE RECURRENCE (root cause)
+─────────────────────────────────────────
+
+1. Design Console → Process Definition (for the affected process) → check Auto Save Form. Required for any access-policy/auto-triggered provisioning: OIM must save the form itself at instantiation (VERIFIED, dev guide Table 2-1).
+2. Then guarantee every Required process-form field gets data automatically: a working prepopulate adapter per field (with correct mappings), or a default. A Required field with no data source = every auto-provisioned account sticks here.
+3. If on BP16+, keep the Real-time Provisioning Status purge running as a safety net.
+
+═══════════════════════════════════════════════════════
